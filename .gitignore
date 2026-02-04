@@ -1,0 +1,16 @@
+# python
+__pycache__/
+*.py[cod]
+
+# virtual env
+.env
+.env.*
+venv/
+venv312/
+
+# logs
+*.log
+
+# IDE
+.vscode/
+.idea/
