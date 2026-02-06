@@ -1745,96 +1745,65 @@ def api_publish_car_manual(body: PublishCarBody) -> Dict[str, Any]:
     if not _token():
         raise HTTPException(status_code=503, detail="999.md token not set")
 
-    if body.item_id is not None:
-        raw = fetch_raw_by_item_id(body.item_id)
-        if not raw:
-            raise HTTPException(status_code=404, detail=f"Item id={body.item_id} not found in {DATA_TABLE_SP1114}")
-        if not should_send_like_tg(raw):
+    if body.item_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Обязателен item_id. Публикация только по ID из БД (машина должна быть в tg_sent_items).",
+        )
+
+    raw = fetch_raw_by_item_id(body.item_id)
+    if not raw:
+        raise HTTPException(status_code=404, detail=f"Item id={body.item_id} not found in {DATA_TABLE_SP1114}")
+    if not should_send_like_tg(raw):
+        raise HTTPException(
+            status_code=400,
+            detail="Машина не проходит фильтр Telegram (не все обязательные поля заполнены). На 999 не публикуем.",
+        )
+    conn = _pg_conn()
+    try:
+        if not _was_sent_to_tg(conn, body.item_id):
             raise HTTPException(
                 status_code=400,
-                detail="Машина не проходит фильтр Telegram (не все обязательные поля заполнены). На 999 не публикуем.",
+                detail="На 999 шлём только машины, уже отправленные в TG_AUTO. Сначала отправьте в канал (должна быть запись в tg_sent_items).",
             )
-        conn = _pg_conn()
-        try:
-            if not _was_sent_to_tg(conn, body.item_id):
-                raise HTTPException(
-                    status_code=400,
-                    detail="На 999 шлём только машины, уже отправленные в TG_AUTO. Сначала отправьте в канал (должна быть запись в tg_sent_items).",
-                )
-        finally:
-            conn.close()
-        car = car_data_from_raw(raw)
-        if not car.get("image_urls"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"В raw нет фото (ключ {PHOTO_RAW_KEY}, url/urlMachine). Добавьте фото в карточку.",
-            )
-        if not car.get("marca") or not car.get("model"):
-            raise HTTPException(status_code=400, detail="В raw нет марки или модели.")
-        if not car.get("price") or car["price"] <= 0:
-            raise HTTPException(status_code=400, detail="В raw нет цены или она 0.")
-        try:
-            result = publish_car_manual(
-                marca=car["marca"],
-                model=car["model"],
-                year=car["year"],
-                price=car["price"],
-                price_unit=car.get("price_unit") or "eur",
-                mileage_km=car.get("mileage_km"),
-                description=car.get("description") or "",
-                numar_auto=car.get("numar_auto") or "",
-                phone=car.get("phone") or body.phone or "",
-                image_urls=car["image_urls"],
-                image_paths=None,
-                region_option_id=body.region_option_id,
-                listing_title=car.get("listing_title"),
-                category_id=raw.get("categoryId"),
-                body_type_option_id=car.get("body_type_option_id"),
-                fuel_option_id=car.get("fuel_option_id"),
-                engine_option_id=car.get("engine_option_id"),
-                drive_option_id=car.get("drive_option_id"),
-                transmission_option_id=car.get("transmission_option_id"),
-            )
-            return {"ok": True, "999md": result, "source": "db", "item_id": body.item_id}
-        except Exception as e:
-            print(f"ERROR publish_999md item_id={body.item_id}: {e}", file=sys.stderr, flush=True)
-            raise
-    else:
-        if not body.marca or not body.model or body.year is None or not body.price or body.price <= 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Без item_id нужны: marca, model, year, price",
-            )
-        if not (body.image_urls or body.image_paths):
-            raise HTTPException(
-                status_code=400,
-                detail="Нужно хотя бы одно фото: image_urls или image_paths",
-            )
-        try:
-            result = publish_car_manual(
-                marca=body.marca,
-                model=body.model,
-                year=body.year,
-                price=body.price,
-                price_unit=body.price_unit or "eur",
-                mileage_km=body.mileage_km,
-                description=body.description or "",
-                numar_auto=body.numar_auto or "",
-                phone=body.phone or "",
-                image_urls=body.image_urls,
-                image_paths=body.image_paths,
-                region_option_id=body.region_option_id,
-            )
-            return {"ok": True, "999md": result}
-        except requests.HTTPError as e:
-            msg = e.response.text if e.response is not None else str(e)
-            print(f"ERROR publish_999md: HTTP {e.response.status_code if e.response else ''} {msg}", file=sys.stderr, flush=True)
-            raise HTTPException(status_code=502, detail=f"999.md API error: {msg}")
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        except Exception as e:
-            print(f"ERROR publish_999md: {e}", file=sys.stderr, flush=True)
-            raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+    car = car_data_from_raw(raw)
+    if not car.get("image_urls"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"В raw нет фото (ключ {PHOTO_RAW_KEY}, url/urlMachine). Добавьте фото в карточку.",
+        )
+    if not car.get("marca") or not car.get("model"):
+        raise HTTPException(status_code=400, detail="В raw нет марки или модели.")
+    if not car.get("price") or car["price"] <= 0:
+        raise HTTPException(status_code=400, detail="В raw нет цены или она 0.")
+    try:
+        result = publish_car_manual(
+            marca=car["marca"],
+            model=car["model"],
+            year=car["year"],
+            price=car["price"],
+            price_unit=car.get("price_unit") or "eur",
+            mileage_km=car.get("mileage_km"),
+            description=car.get("description") or "",
+            numar_auto=car.get("numar_auto") or "",
+            phone=car.get("phone") or body.phone or "",
+            image_urls=car["image_urls"],
+            image_paths=None,
+            region_option_id=body.region_option_id,
+            listing_title=car.get("listing_title"),
+            category_id=raw.get("categoryId"),
+            body_type_option_id=car.get("body_type_option_id"),
+            fuel_option_id=car.get("fuel_option_id"),
+            engine_option_id=car.get("engine_option_id"),
+            drive_option_id=car.get("drive_option_id"),
+            transmission_option_id=car.get("transmission_option_id"),
+        )
+        return {"ok": True, "999md": result, "source": "db", "item_id": body.item_id}
+    except Exception as e:
+        print(f"ERROR publish_999md item_id={body.item_id}: {e}", file=sys.stderr, flush=True)
+        raise
 
 
 def publish_car_manual(
@@ -2056,6 +2025,17 @@ def _auto_publish_loop() -> None:
             if not car.get("price") or car["price"] <= 0:
                 print(f"AUTO_999: item_id={item_id} без цены, пропуск.", flush=True)
                 continue
+            conn = _pg_conn()
+            try:
+                if not _was_sent_to_tg(conn, item_id):
+                    print(
+                        f"SKIP 999.md: item_id={item_id} нет в tg_sent_items — на 999 не шлём.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+            finally:
+                conn.close()
             try:
                 print(f"AUTO_999: публикуем на 999 item_id={item_id} ...", flush=True)
                 publish_car_manual(
