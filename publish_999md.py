@@ -135,6 +135,23 @@ STAGE_ID_TO_NAME: Dict[str, str] = {
     "DT1114_111:UC_7R6IQX": "Nobil Arena",
 }
 
+# Дефолтные option id для payload 999 (чтобы API принимал объявление, если по Bitrix не удалось разрешить)
+DEFAULTS_PAYLOAD_999: Dict[str, str] = {
+    "775": "18592",
+    "593": "18668",
+    "1761": "29670",
+    "1763": "29677",
+    "795": "23241",
+    "1196": "21979",
+    "846": "19119",
+    "102": "6",
+    "2553": "43680",
+    "151": "10",
+    "108": "5",
+    "101": "4",
+    "7": "12900",
+}
+
 # 999.md фича 19 (год): textbox_numeric, не список опций — отправляем число. Диапазон по API.
 YEAR_MIN_999 = 1990
 YEAR_MAX_999 = 2030
@@ -1004,45 +1021,58 @@ def _mark_sent_to_999(conn, item_id: int) -> None:
 
 
 def fetch_next_raw_for_999() -> Optional[Dict[str, Any]]:
-    """Следующая машина для 999. Логика 1-в-1 как fetch_next_raw_with_photos в auto_send_tg (без tg_sent_items как фильтра)."""
+    """Следующая машина для 999. Только те, что уже ушли в TG (tg_sent_items), затем — ещё не на 999."""
+    conn = None
     try:
         conn = _pg_conn()
         _ensure_999_sent_table(conn)
         created_expr = "COALESCE(NULLIF(t.raw->>'createdTime','')::timestamptz, NULLIF(t.raw->>'createdate','')::timestamptz)"
         scalar_filters = [f"COALESCE(t.raw->>'{k}', '') <> ''" for k in REQUIRE_ALL_FILLED_SCALAR_FIELDS]
         scalar_sql = " AND ".join(scalar_filters) if scalar_filters else "TRUE"
-        q = f"""
-            SELECT t.raw
-            FROM {DATA_TABLE_SP1114} t
-            LEFT JOIN {SENT_999_TABLE} s ON s.item_id = NULLIF(t.raw->>'id','')::bigint
-            WHERE s.item_id IS NULL
-              AND t.raw ? 'id'
-              AND COALESCE(t.categoryid::text, t.raw->>'categoryId') = %s
-              AND t.raw ? %s
-              AND jsonb_typeof(t.raw->%s) = 'array'
-              AND jsonb_array_length(t.raw->%s) >= %s
-              AND jsonb_array_length(t.raw->%s) <= %s
-              AND {created_expr} >= (now() AT TIME ZONE 'UTC') - interval '14 days'
-              AND {scalar_sql}
-            ORDER BY {created_expr} DESC NULLS LAST
-            LIMIT 1
-        """
-        with conn.cursor() as cur:
-            cur.execute(
-                q,
-                (CATEGORY_ID_SP1114, PHOTO_RAW_KEY, PHOTO_RAW_KEY, PHOTO_RAW_KEY, MIN_PHOTOS_999, PHOTO_RAW_KEY, MAX_PHOTOS_999),
-            )
-            row = cur.fetchone()
-        conn.close()
-        if row and row[0]:
-            return row[0] if isinstance(row[0], dict) else None
+        params = (CATEGORY_ID_SP1114, PHOTO_RAW_KEY, PHOTO_RAW_KEY, PHOTO_RAW_KEY, MIN_PHOTOS_999, PHOTO_RAW_KEY, MAX_PHOTOS_999)
+        for order_by in ("tg.sent_at DESC NULLS LAST", f"{created_expr} DESC NULLS LAST"):
+            try:
+                q = f"""
+                    SELECT t.raw
+                    FROM {DATA_TABLE_SP1114} t
+                    INNER JOIN {SENT_TG_TABLE} tg ON tg.item_id = NULLIF(t.raw->>'id','')::bigint
+                    LEFT JOIN {SENT_999_TABLE} s ON s.item_id = NULLIF(t.raw->>'id','')::bigint
+                    WHERE s.item_id IS NULL
+                      AND t.raw ? 'id'
+                      AND COALESCE(t.categoryid::text, t.raw->>'categoryId') = %s
+                      AND t.raw ? %s
+                      AND jsonb_typeof(t.raw->%s) = 'array'
+                      AND jsonb_array_length(t.raw->%s) >= %s
+                      AND jsonb_array_length(t.raw->%s) <= %s
+                      AND {created_expr} >= (now() AT TIME ZONE 'UTC') - interval '14 days'
+                      AND {scalar_sql}
+                    ORDER BY {order_by}
+                    LIMIT 1
+                """
+                with conn.cursor() as cur:
+                    cur.execute(q, params)
+                    row = cur.fetchone()
+                if row and row[0]:
+                    return row[0] if isinstance(row[0], dict) else None
+                return None
+            except Exception as e:
+                if "sent_at" in str(e).lower() or "column" in str(e).lower():
+                    print(f"WARN fetch_next_raw_for_999: {e}, пробую без sent_at", file=sys.stderr, flush=True)
+                    continue
+                raise
     except Exception as e:
         print(f"ERROR fetch_next_raw_for_999: {e}", file=sys.stderr, flush=True)
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
     return None
 
 
 def fetch_random_raw_for_999() -> Optional[Dict[str, Any]]:
-    """Случайная машина для 999. Логика как fetch_random_raw_with_photos в auto_send_tg (без tg_sent_items)."""
+    """Случайная машина для 999 — только из тех, что уже в tg_sent_items."""
     try:
         conn = _pg_conn()
         with conn.cursor() as cur:
@@ -1050,6 +1080,7 @@ def fetch_random_raw_for_999() -> Optional[Dict[str, Any]]:
                 f"""
                 SELECT t.raw
                 FROM {DATA_TABLE_SP1114} t
+                INNER JOIN {SENT_TG_TABLE} tg ON tg.item_id = NULLIF(t.raw->>'id','')::bigint
                 WHERE COALESCE(t.categoryid::text, t.raw->>'categoryId') = %s
                   AND t.raw ? %s
                   AND jsonb_typeof(t.raw->%s) = 'array'
@@ -1397,23 +1428,22 @@ def build_advert_payload(
         title = re.sub(re.escape(numar_auto), "", title, flags=re.IGNORECASE)
     title = re.sub(r"\s+", " ", title).strip() or f"{marca} {model}".strip()
     add("12", title)
-    v = kwargs.get("registration_option_id"); add("775", v) if v is not None else None
-    v = kwargs.get("state_option_id"); add("593", v) if v is not None else None
-    v = kwargs.get("availability_option_id"); add("1761", v) if v is not None else None
-    v = kwargs.get("origin_option_id"); add("1763", v) if v is not None else None
-    v = kwargs.get("author_option_id"); add("795", v) if v is not None else None
+    add("775", kwargs.get("registration_option_id") or DEFAULTS_PAYLOAD_999["775"])
+    add("593", kwargs.get("state_option_id") or DEFAULTS_PAYLOAD_999["593"])
+    add("1761", kwargs.get("availability_option_id") or DEFAULTS_PAYLOAD_999["1761"])
+    add("1763", kwargs.get("origin_option_id") or DEFAULTS_PAYLOAD_999["1763"])
+    add("795", kwargs.get("author_option_id") or DEFAULTS_PAYLOAD_999["795"])
     year_ok = max(YEAR_MIN_999, min(YEAR_MAX_999, int(year)))
     add("19", year_ok)
-    v = kwargs.get("steering_option_id"); add("1196", v) if v is not None else None
-    v = kwargs.get("seats_option_id"); add("846", v) if v is not None else None
-    v = kwargs.get("body_type_option_id"); add("102", v) if v is not None else None
+    add("1196", kwargs.get("steering_option_id") or DEFAULTS_PAYLOAD_999["1196"])
+    add("846", kwargs.get("seats_option_id") or DEFAULTS_PAYLOAD_999["846"])
+    add("102", kwargs.get("body_type_option_id") or DEFAULTS_PAYLOAD_999["102"])
     add("104", mileage_km if mileage_km is not None else 0, "km")
-    v = kwargs.get("engine_option_id"); add("2553", v) if v is not None else None
-    v = kwargs.get("fuel_option_id"); add("151", v) if v is not None else None
-    v = kwargs.get("drive_option_id"); add("108", v) if v is not None else None
-    v = kwargs.get("transmission_option_id"); add("101", v) if v is not None else None
-    if region_option_id is not None:
-        add("7", region_option_id)
+    add("2553", kwargs.get("engine_option_id") or DEFAULTS_PAYLOAD_999["2553"])
+    add("151", kwargs.get("fuel_option_id") or DEFAULTS_PAYLOAD_999["151"])
+    add("108", kwargs.get("drive_option_id") or DEFAULTS_PAYLOAD_999["108"])
+    add("101", kwargs.get("transmission_option_id") or DEFAULTS_PAYLOAD_999["101"])
+    add("7", region_option_id or DEFAULTS_PAYLOAD_999["7"])
     add("2", int(price), price_unit if price_unit in ("eur", "usd", "mdl") else "eur")
 
     body_text = _strip_numar_from_description(description or "", numar_auto) or ""
@@ -1510,10 +1540,10 @@ def send_telegram_notification_999(
     if advert_id:
         link_ru = f"https://999.md/ru/{advert_id}"
         link_edit_ro = f"https://999.md/ro/{advert_id}/edit?offer_type=776"
-        lines.append(f'🔗 <a href="{link_ru}">Открыть объявление</a> ({link_ru})')
+        lines.append(f'🔗 <a href="{link_ru}">Открыть объявление</a>')
         lines.append("")
         lines.append("Зайди, проверь и опулбликуй объявление —")
-        lines.append(f'🤳 <a href="{link_edit_ro}">Редактировать объявление</a> ({link_edit_ro})')
+        lines.append(f'🛠️ <a href="{link_edit_ro}">Редактировать объявление</a>')
     text = "\n".join(lines)
     base_url = f"https://api.telegram.org/bot{TG_BOT_TOKEN_999}"
     try:
@@ -1724,6 +1754,15 @@ def api_publish_car_manual(body: PublishCarBody) -> Dict[str, Any]:
                 status_code=400,
                 detail="Машина не проходит фильтр Telegram (не все обязательные поля заполнены). На 999 не публикуем.",
             )
+        conn = _pg_conn()
+        try:
+            if not _was_sent_to_tg(conn, body.item_id):
+                raise HTTPException(
+                    status_code=400,
+                    detail="На 999 шлём только машины, уже отправленные в TG_AUTO. Сначала отправьте в канал (должна быть запись в tg_sent_items).",
+                )
+        finally:
+            conn.close()
         car = car_data_from_raw(raw)
         if not car.get("image_urls"):
             raise HTTPException(
@@ -1973,8 +2012,10 @@ def _auto_publish_loop() -> None:
                 continue
             raw = fetch_next_raw_for_999()
             if not raw:
-                print("AUTO_999: нет машин под условия, жду...", flush=True)
+                print("AUTO_999: нет машин под условия (tg_sent + не на 999 + category 111 + 5–10 фото + скаляры), жду...", flush=True)
                 continue
+            item_id = get_item_id_from_raw(raw)
+            print(f"AUTO_999: кандидат item_id={item_id}, проверки...", flush=True)
             if not should_send_like_tg(raw):
                 item_id = get_item_id_from_raw(raw)
                 print(
@@ -1983,7 +2024,6 @@ def _auto_publish_loop() -> None:
                     flush=True,
                 )
                 continue
-            item_id = get_item_id_from_raw(raw)
             if not item_id:
                 continue
             photo_urls = extract_photo_urls_from_raw(raw, _bitrix_webhook())
@@ -1997,6 +2037,7 @@ def _auto_publish_loop() -> None:
             conn = _pg_conn()
             try:
                 if _was_sent_to_999(conn, item_id):
+                    print(f"AUTO_999: item_id={item_id} уже на 999, пропуск", flush=True)
                     continue
             finally:
                 conn.close()
@@ -2016,6 +2057,7 @@ def _auto_publish_loop() -> None:
                 print(f"AUTO_999: item_id={item_id} без цены, пропуск.", flush=True)
                 continue
             try:
+                print(f"AUTO_999: публикуем на 999 item_id={item_id} ...", flush=True)
                 publish_car_manual(
                     marca=car["marca"],
                     model=car["model"],
