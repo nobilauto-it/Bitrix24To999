@@ -117,6 +117,8 @@ REQUIRE_ALL_FILLED_SCALAR_FIELDS = [
     "ufCrm34_1756926228375",
 ]
 MAX_AGE_DAYS_FOR_AUTO_999 = 14
+# Только машины, недавно попавшие в TG (по tg.sent_at). Старые не гоняем — потом разгон через отдельный API.
+TG_SENT_MAX_AGE_DAYS = 7
 MIN_PHOTOS_999 = 5
 MAX_PHOTOS_999 = 10
 
@@ -1030,8 +1032,17 @@ def fetch_next_raw_for_999() -> Optional[Dict[str, Any]]:
         scalar_filters = [f"COALESCE(t.raw->>'{k}', '') <> ''" for k in REQUIRE_ALL_FILLED_SCALAR_FIELDS]
         scalar_sql = " AND ".join(scalar_filters) if scalar_filters else "TRUE"
         params = (CATEGORY_ID_SP1114, PHOTO_RAW_KEY, PHOTO_RAW_KEY, PHOTO_RAW_KEY, MIN_PHOTOS_999, PHOTO_RAW_KEY, MAX_PHOTOS_999)
-        for order_by in ("tg.sent_at DESC NULLS LAST", f"{created_expr} DESC NULLS LAST"):
+        # Сначала запрос только по «свежим» TG (tg.sent_at за последние N дней). Старые не трогаем.
+        for order_by, only_recent_tg in [
+            ("tg.sent_at DESC NULLS LAST", True),
+            (f"{created_expr} DESC NULLS LAST", False),
+        ]:
             try:
+                recent_tg_filter = (
+                    f"AND tg.sent_at >= (now() AT TIME ZONE 'UTC') - interval '{TG_SENT_MAX_AGE_DAYS} days'"
+                    if only_recent_tg
+                    else ""
+                )
                 q = f"""
                     SELECT t.raw
                     FROM {DATA_TABLE_SP1114} t
@@ -1045,6 +1056,7 @@ def fetch_next_raw_for_999() -> Optional[Dict[str, Any]]:
                       AND jsonb_array_length(t.raw->%s) >= %s
                       AND jsonb_array_length(t.raw->%s) <= %s
                       AND {created_expr} >= (now() AT TIME ZONE 'UTC') - interval '14 days'
+                      {recent_tg_filter}
                       AND {scalar_sql}
                     ORDER BY {order_by}
                     LIMIT 1
@@ -1849,6 +1861,17 @@ def publish_car_manual(
             "Не удалось загрузить ни одного фото. Объявление не публикуется."
         )
 
+    item_id = kwargs.get("item_id")
+    if item_id is not None:
+        conn = _pg_conn()
+        try:
+            if not _was_sent_to_tg(conn, int(item_id)):
+                raise RuntimeError(
+                    f"item_id={item_id} нет в tg_sent_items. На 999 не публикуем."
+                )
+        finally:
+            conn.close()
+
     payload = build_advert_payload(
         marca=marca,
         model=model,
@@ -1984,7 +2007,15 @@ def _auto_publish_loop() -> None:
                 print("AUTO_999: нет машин под условия (tg_sent + не на 999 + category 111 + 5–10 фото + скаляры), жду...", flush=True)
                 continue
             item_id = get_item_id_from_raw(raw)
-            print(f"AUTO_999: кандидат item_id={item_id}, проверки...", flush=True)
+            conn_log = _pg_conn()
+            try:
+                with conn_log.cursor() as cur:
+                    cur.execute(f"SELECT sent_at FROM {SENT_TG_TABLE} WHERE item_id = %s", (item_id,))
+                    row_tg = cur.fetchone()
+                sent_at_str = str(row_tg[0]) if row_tg and row_tg[0] else "?"
+                print(f"AUTO_999: кандидат item_id={item_id} (из tg_sent_items, sent_at={sent_at_str}), проверки...", flush=True)
+            finally:
+                conn_log.close()
             if not should_send_like_tg(raw):
                 item_id = get_item_id_from_raw(raw)
                 print(
@@ -2076,6 +2107,20 @@ def start_auto_publish_999_thread() -> None:
     """Запустить фоновый поток авто-отправки на 999 (если AUTO_PUBLISH_999_ENABLED=1)."""
     if not AUTO_PUBLISH_999_ENABLED:
         return
+    try:
+        conn = _pg_conn()
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM {SENT_TG_TABLE}")
+            row = cur.fetchone()
+            n_tg = row[0] if row else 0
+        conn.close()
+        print(
+            f"AUTO_999: БД host={PG_HOST} dbname={PG_DB} — в {SENT_TG_TABLE} строк: {n_tg}. "
+            "Должна быть та же БД, что у auto_send_tg.",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"AUTO_999: WARN при проверке БД: {e}", file=sys.stderr, flush=True)
     t = threading.Thread(target=_auto_publish_loop, daemon=True)
     t.start()
     print("AUTO_999: фоновый поток авто-отправки на 999 запущен.", flush=True)
