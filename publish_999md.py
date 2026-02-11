@@ -8,8 +8,7 @@ API: https://partners-api.999.md
 Фото: только raw["ufCrm34_1756897294"], берём "url" (ajax.php), для скачивания — REST URL или urlMachine (вебхук подставляется из env BITRIX_WEBHOOK).
 ID (iblock_element) расшифровываются через таблицу/кэш или REST lists.element.get, иначе остаются цифрами.
 
-Важно: по доке 999.md access_policy только "private"|"public" (draft нет). Создаём с private и сразу ставим private — объявление в «Скрытые», не в «Активные».
-Никогда не публикуем автоматически — сотрудник смотрит в «Черновики» на 999 и сам нажимает «Опубликовать».
+По доке 999.md access_policy только "private"|"public". Создаём с public — объявление сразу в «Активные».
 
 Запуск как сервис (отдельный порт):
   API_999MD_TOKEN=... BITRIX_WEBHOOK=... PG_HOST=... PG_USER=... PG_PASS=... python publish_999md.py
@@ -78,7 +77,7 @@ SUBCATEGORY_ID = "659"
 OFFER_TYPE = "776"
 
 # Режим «только локальные черновики»: не вызывать POST /adverts, только сохранять payload в 999md_drafts/.
-# 0 = шлём POST на 999 (объявление уходит в «Скрытые», access_policy private). 1 = только локальный черновик (не шлём на 999).
+# 0 = шлём POST на 999 (объявление сразу в «Активные», access_policy public). 1 = только локальный черновик (не шлём на 999).
 PUBLISH_999MD_DRAFT_ONLY = os.getenv("PUBLISH_999MD_DRAFT_ONLY", "0").strip().lower() in ("1", "true", "yes")
 DRAFTS_DIR = Path(__file__).resolve().parent / "999md_drafts"
 
@@ -158,6 +157,48 @@ DEFAULTS_PAYLOAD_999: Dict[str, str] = {
 YEAR_MIN_999 = 1990
 YEAR_MAX_999 = 2030
 
+# Шаблон объявления 999: заголовок и описание на румынском и русском (без внешних ссылок).
+TEMPLATE_LISTING_TITLE = "{MARKA} {MODEL} {ANI} {MOTOR} | Credit 0% Avans | Aprobare rapidă"
+TEMPLATE_DESC_RO = """🚘 {{MARCA}} {{MODEL}} {{AN}}
+⚙️ {{MOTOR}} | {{TRACTIUNE}} | {{CUTIE}}
+💰 Preț: {{PRET}} €
+━━━━━━━━━━━━━━━━━━
+✅ CREDIT AUTO – ANALIZĂ INDIVIDUALĂ
+━━━━━━━━━━━━━━━━━━
+✔ Termen de achitare: 12 – 60 luni
+✔ Condiții personalizate
+✔ Posibilitate de avans flexibil
+
+🔹 Eligibilitate:
+– venit stabil (oficial sau din străinătate)
+– istoric financiar analizat individual
+– buletin de identitate
+
+🔹 Condiții:
+– automobilul se înmatriculează pe numele clientului
+– deveniți proprietar imediat
+– achitare anticipată fără penalități"""
+TEMPLATE_DESC_RU = """🚘 {{MARCA}} {{MODEL}} {{ГОД}}
+⚙️ {{ДВИГАТЕЛЬ}} | {{ПРИВОД}} | {{КОРОБКА}}
+💰 Цена: {{ЦЕНА}} €
+
+━━━━━━━━━━━━━━━━━━
+✅ АВТОКРЕДИТ – ИНДИВИДУАЛЬНОЕ РАССМОТРЕНИЕ
+━━━━━━━━━━━━━━━━━━
+✔ Срок кредитования: 12 – 60 месяцев
+✔ Индивидуальные условия
+✔ Гибкий первоначальный взнос
+
+🔹 Требования:
+– стабильный доход (в стране или за границей)
+– индивидуальный финансовый анализ
+– удостоверение личности
+
+🔹 Условия:
+– автомобиль оформляется на клиента
+– вы сразу становитесь владельцем
+– досрочное погашение без штрафов"""
+
 # Явный маппинг Bitrix (значение, lower) -> 999 option id. По данным GET /features (lang=ru).
 # 102=Тип кузова. Bitrix Caroserie (IBLOCK 100): Hatchback, MPV, Sedan, Universal, SUV, Bus|Passageri, Bus|Cargo, Coupe, Cabrio, Evacuator, Minivan.
 # 999.md: Внедорожник=18, Кабриолет=156, Комби=68, Кроссовер=74, Купе=96, Микровэн=53, Минивэн=49, Пикап=61, Родстер=265, Седан=6, Универсал=27, Фургон=97, Хетчбэк=11.
@@ -212,6 +253,8 @@ ENABLE_ENUM_API_LOOKUP = True
 
 # Токен 999.md: env API_999MD_TOKEN или запасной (подставь свой)
 API_999MD_TOKEN_DEFAULT = os.getenv("API_999MD_TOKEN", "TreE0PnGG7MGZJUuxZUwDWN_UZNY")
+# Телефон в «Контактах» на 999: env PUBLISH_999MD_PHONE. Дефолт пустой — когда будет номер, задай в .env или сюда.
+PUBLISH_999MD_PHONE_DEFAULT = ""
 
 # Вебхук Bitrix24: только захардкоженный (без .env)
 BITRIX_WEBHOOK_DEFAULT = "https://nobilauto.bitrix24.ru/rest/18397/h5c7kw97sfp3uote"
@@ -1333,17 +1376,32 @@ def car_data_from_raw(raw: Dict[str, Any]) -> Dict[str, Any]:
     if transmission_str:
         transmission_option_id = _resolve_option("101", transmission_str)
 
+    year_ok = year_val or 2020
+    price_ok = price_val or 0
+    template_listing_title, description_ru, description_ro = _build_999_template_texts(
+        marca=marca,
+        model=model,
+        year=year_ok,
+        price=price_ok,
+        engine_display=engine_str,
+        drive_display=drive_str,
+        transmission_display=transmission_str,
+    )
+
     return {
         "marca": marca,
         "model": model,
         "listing_title": listing_title,
-        "year": year_val or 2020,
-        "price": price_val or 0,
+        "template_listing_title": template_listing_title,
+        "description": description,
+        "description_ru": description_ru,
+        "description_ro": description_ro,
+        "year": year_ok,
+        "price": price_ok,
         "price_unit": "eur",
         "mileage_km": mileage_val,
-        "description": description,
         "numar_auto": numar_auto,
-        "phone": os.getenv("PUBLISH_999MD_PHONE", "").strip(),
+        "phone": (os.getenv("PUBLISH_999MD_PHONE") or "").strip() or PUBLISH_999MD_PHONE_DEFAULT,
         "image_urls": photo_urls,
         "body_type_option_id": body_type_option_id,
         "fuel_option_id": fuel_option_id,
@@ -1351,6 +1409,53 @@ def car_data_from_raw(raw: Dict[str, Any]) -> Dict[str, Any]:
         "drive_option_id": drive_option_id,
         "transmission_option_id": transmission_option_id,
     }
+
+
+def _build_999_template_texts(
+    marca: str,
+    model: str,
+    year: int,
+    price: float,
+    engine_display: str = "",
+    drive_display: str = "",
+    transmission_display: str = "",
+) -> Tuple[str, str, str]:
+    """Собрать заголовок и описание RU/RO по шаблону 999 (без внешних ссылок)."""
+    marca = (marca or "").strip()
+    model = (model or "").strip()
+    motor = (engine_display or "").strip() or "–"
+    tractiune = (drive_display or "").strip() or "–"
+    cutie = (transmission_display or "").strip() or "–"
+    pret = str(int(price)) if price is not None and price >= 0 else "0"
+    ani = str(int(year)) if year else "–"
+
+    title = TEMPLATE_LISTING_TITLE.replace("{MARKA}", marca).replace("{MODEL}", model)
+    title = title.replace("{ANI}", ani).replace("{MOTOR}", motor)
+
+    desc_ro = TEMPLATE_DESC_RO.replace("{{MARCA}}", marca).replace("{{MODEL}}", model)
+    desc_ro = desc_ro.replace("{{AN}}", ani).replace("{{MOTOR}}", motor)
+    desc_ro = desc_ro.replace("{{TRACTIUNE}}", tractiune).replace("{{CUTIE}}", cutie).replace("{{PRET}}", pret)
+
+    desc_ru = TEMPLATE_DESC_RU.replace("{{MARCA}}", marca).replace("{{MODEL}}", model)
+    desc_ru = desc_ru.replace("{{ГОД}}", ani).replace("{{ДВИГАТЕЛЬ}}", motor)
+    desc_ru = desc_ru.replace("{{ПРИВОД}}", tractiune).replace("{{КОРОБКА}}", cutie).replace("{{ЦЕНА}}", pret)
+
+    return title, desc_ru, desc_ro
+
+
+def _strip_external_links_from_description(text: str) -> str:
+    """Убрать из описания внешние ссылки (nobilauto.md и др.), чтобы 999 не блокировал объявление «Несовпадение контактов»."""
+    if not text or not isinstance(text, str):
+        return (text or "").strip()
+    lines = []
+    for line in text.split("\n"):
+        line = line.strip()
+        # Удалить строки, которые целиком URL или содержат ссылку на внешний сайт (не 999.md)
+        if re.search(r"https?://", line, re.IGNORECASE):
+            continue
+        if line:
+            lines.append(line)
+    return "\n".join(lines).strip()
 
 
 def _strip_numar_from_description(text: str, numar_auto: str = "") -> str:
@@ -1428,8 +1533,11 @@ def build_advert_payload(
     add("21", model_id)
     if generation_id:
         add("2095", generation_id)
-    # Одно название объявления: переданное listing_title ИЛИ марка+модель (никогда не смешиваем)
-    if listing_title and str(listing_title).strip():
+    # Заголовок: из шаблона 999 (template_listing_title) или fallback на listing_title / марка+модель
+    template_title = (kwargs.get("template_listing_title") or "").strip()
+    if template_title:
+        title = _strip_numar_from_title(template_title) or template_title
+    elif listing_title and str(listing_title).strip():
         title = str(listing_title).strip()
     else:
         title = f"{marca} {model}".strip()
@@ -1458,10 +1566,17 @@ def build_advert_payload(
     add("7", region_option_id or DEFAULTS_PAYLOAD_999["7"])
     add("2", int(price), price_unit if price_unit in ("eur", "usd", "mdl") else "eur")
 
-    body_text = _strip_numar_from_description(description or "", numar_auto) or ""
-    # Номер машины нигде не показываем — ни в заголовке, ни в описании
-    if body_text:
-        add("13", body_text)
+    # Описание: RU и RO отдельно — 999 подставляет текст по выбранному языку (не оба сразу).
+    # Пробуем передать объект {"ru": "...", "ro": "..."}; если API примет только строку — будет fallback.
+    description_ru = (kwargs.get("description_ru") or "").strip()
+    description_ro = (kwargs.get("description_ro") or "").strip()
+    if description_ru and description_ro:
+        add("13", {"ru": description_ru, "ro": description_ro})
+    else:
+        body_text = _strip_numar_from_description(description or "", numar_auto) or ""
+        body_text = _strip_external_links_from_description(body_text) or ""
+        if body_text:
+            add("13", body_text)
 
     if image_ids:
         add("14", image_ids)
@@ -1476,13 +1591,13 @@ def build_advert_payload(
             normalized = "373" + normalized
         add("16", [normalized])
 
-    # Скрытое: access_policy "private" — объявление в «Скрытые» на 999.
+    # access_policy "public" — объявление сразу в «Активные» на 999.
     return {
         "category_id": CATEGORY_ID,
         "subcategory_id": SUBCATEGORY_ID,
         "offer_type": OFFER_TYPE,
         "features": features,
-        "access_policy": "private",
+        "access_policy": "public",
     }
 
 
@@ -1506,8 +1621,61 @@ def _payload_without_phone(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def post_advert(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """POST /adverts — создание объявления (access_policy в payload, после создания ставим private)."""
+    """POST /adverts — создание объявления (access_policy public — сразу в «Активные»)."""
     return _post_json("/adverts", payload)
+
+
+def patch_advert_features(advert_id: str, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """PATCH /adverts/{id} — обновить объявление (features: заголовок, описание, цена, фото и т.д.)."""
+    return _patch_json(f"/adverts/{advert_id}", {"features": features})
+
+
+def update_advert_from_item(
+    advert_id: str,
+    item_id: int,
+    car: Optional[Dict[str, Any]] = None,
+    raw: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Обновить объявление на 999 по данным из Битрикса (item_id). Загружает фото, собирает payload, PATCH /adverts/{id}."""
+    if car is None or raw is None:
+        raw = raw or fetch_raw_by_item_id(item_id)
+        if not raw:
+            raise ValueError(f"Item id={item_id} not found")
+        car = car_data_from_raw(raw)
+    image_urls = car.get("image_urls") or []
+    if not image_urls:
+        raise ValueError("Нет фото для объявления")
+    image_ids: List[str] = []
+    for url in image_urls:
+        img_id, _ = upload_image_from_url_optional(url)
+        if img_id:
+            image_ids.append(img_id)
+    if not image_ids:
+        raise RuntimeError("Не удалось загрузить ни одного фото на 999.")
+    payload = build_advert_payload(
+        marca=car["marca"],
+        model=car["model"],
+        year=car["year"],
+        price=car["price"],
+        price_unit=car.get("price_unit") or "eur",
+        mileage_km=car.get("mileage_km"),
+        description=car.get("description") or "",
+        numar_auto=car.get("numar_auto") or "",
+        phone=car.get("phone") or "",
+        image_ids=image_ids,
+        region_option_id=car.get("region_option_id"),
+        listing_title=car.get("listing_title"),
+        template_listing_title=car.get("template_listing_title"),
+        description_ru=car.get("description_ru"),
+        description_ro=car.get("description_ro"),
+        category_id=raw.get("categoryId"),
+        body_type_option_id=car.get("body_type_option_id"),
+        fuel_option_id=car.get("fuel_option_id"),
+        engine_option_id=car.get("engine_option_id"),
+        drive_option_id=car.get("drive_option_id"),
+        transmission_option_id=car.get("transmission_option_id"),
+    )
+    return patch_advert_features(str(advert_id), payload["features"])
 
 
 def patch_advert_state(advert_id: str, state: str) -> Optional[Dict[str, Any]]:
@@ -1805,6 +1973,9 @@ def api_publish_car_manual(body: PublishCarBody) -> Dict[str, Any]:
             image_paths=None,
             region_option_id=body.region_option_id,
             listing_title=car.get("listing_title"),
+            template_listing_title=car.get("template_listing_title"),
+            description_ru=car.get("description_ru"),
+            description_ro=car.get("description_ro"),
             category_id=raw.get("categoryId"),
             body_type_option_id=car.get("body_type_option_id"),
             fuel_option_id=car.get("fuel_option_id"),
@@ -1815,6 +1986,37 @@ def api_publish_car_manual(body: PublishCarBody) -> Dict[str, Any]:
         return {"ok": True, "999md": result, "source": "db", "item_id": body.item_id}
     except Exception as e:
         print(f"ERROR publish_999md item_id={body.item_id}: {e}", file=sys.stderr, flush=True)
+        raise
+
+
+class UpdateAdvertBody(BaseModel):
+    """Тело запроса обновления объявления на 999 по данным из Битрикса."""
+    item_id: int = Field(..., description="ID из b24_sp_f_1114 — актуальные данные и фото из БД (raw)")
+
+
+@router.put("/update/{advert_id}")
+def api_update_advert(advert_id: str, body: UpdateAdvertBody) -> Dict[str, Any]:
+    """Обновить существующее объявление на 999 по данным из Битрикса (item_id). Без изменений в БД."""
+    if not _token():
+        raise HTTPException(status_code=503, detail="999.md token not set")
+    raw = fetch_raw_by_item_id(body.item_id)
+    if not raw:
+        raise HTTPException(status_code=404, detail=f"Item id={body.item_id} not found in {DATA_TABLE_SP1114}")
+    car = car_data_from_raw(raw)
+    if not car.get("image_urls"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"В raw нет фото (ключ {PHOTO_RAW_KEY}). Добавьте фото в карточку.",
+        )
+    if not car.get("marca") or not car.get("model"):
+        raise HTTPException(status_code=400, detail="В raw нет марки или модели.")
+    if not car.get("price") or car["price"] <= 0:
+        raise HTTPException(status_code=400, detail="В raw нет цены или она 0.")
+    try:
+        result = update_advert_from_item(advert_id, body.item_id, car=car, raw=raw)
+        return {"ok": True, "999md": result, "advert_id": advert_id, "item_id": body.item_id}
+    except Exception as e:
+        print(f"ERROR update_999 advert_id={advert_id} item_id={body.item_id}: {e}", file=sys.stderr, flush=True)
         raise
 
 
@@ -1898,21 +2100,9 @@ def publish_car_manual(
             "advert": None,
         }
 
-    # Сначала пробуем без телефона — возможно 999 создаёт черновик для «неполного» объявления.
+    # Если телефон указан — всегда шлём объявление с контактами (feature 16), чтобы в «Контактах» отображался номер, а не «Без звонков, предпочитаю сообщения».
     result = None
-    try:
-        payload_no_phone = _payload_without_phone(payload)
-        if payload_no_phone.get("features") != payload.get("features"):
-            try:
-                result = post_advert(payload_no_phone)
-            except RuntimeError as e1:
-                if "400" in str(e1) or "required" in str(e1).lower() or "invalid" in str(e1).lower():
-                    result = None
-                else:
-                    raise
-    except RuntimeError:
-        pass
-    if result is None:
+    if phone:
         try:
             result = post_advert(payload)
         except RuntimeError as e:
@@ -1928,14 +2118,43 @@ def publish_car_manual(
                     "999_error": err_str,
                 }
             raise
+    else:
+        try:
+            payload_no_phone = _payload_without_phone(payload)
+            if payload_no_phone.get("features") != payload.get("features"):
+                try:
+                    result = post_advert(payload_no_phone)
+                except RuntimeError as e1:
+                    if "400" in str(e1) or "required" in str(e1).lower() or "invalid" in str(e1).lower():
+                        result = None
+                    else:
+                        raise
+        except RuntimeError:
+            pass
+        if result is None:
+            try:
+                result = post_advert(payload)
+            except RuntimeError as e:
+                err_str = str(e)
+                if "insufficient balance" in err_str.lower():
+                    draft_path = _save_draft_payload(payload, item_id=kwargs.get("item_id"))
+                    return {
+                        "ok": True,
+                        "draft": True,
+                        "message": "На 999.md недостаточно баланса. Payload сохранён локально.",
+                        "draft_path": draft_path,
+                        "advert": None,
+                        "999_error": err_str,
+                    }
+                raise
 
-    # Сразу после создания ставим access_policy "private" — объявление в «Скрытые».
+    # Объявление создано с access_policy "public" в payload — сразу в «Активные». Дополнительно выставляем public на случай, если API не учёл payload.
     advert_id = (result.get("advert") or {}).get("id")
     if advert_id:
         try:
-            set_advert_access_policy(str(advert_id), "private")
+            set_advert_access_policy(str(advert_id), "public")
         except Exception as e:
-            print(f"WARN: access_policy=private для {advert_id}: {e}", file=sys.stderr, flush=True)
+            print(f"WARN: access_policy=public для {advert_id}: {e}", file=sys.stderr, flush=True)
         first_photo = image_urls[0] if image_urls else None
         send_telegram_notification_999(
             str(advert_id),
@@ -1975,6 +2194,9 @@ def publish_random_car_to_999() -> Optional[Dict[str, Any]]:
             image_paths=None,
             region_option_id=None,
             listing_title=car.get("listing_title"),
+            template_listing_title=car.get("template_listing_title"),
+            description_ru=car.get("description_ru"),
+            description_ro=car.get("description_ro"),
             item_id=item_id,
             category_id=raw.get("categoryId"),
             body_type_option_id=car.get("body_type_option_id"),
@@ -2083,6 +2305,9 @@ def _auto_publish_loop() -> None:
                     image_paths=None,
                     region_option_id=None,
                     listing_title=car.get("listing_title"),
+                    template_listing_title=car.get("template_listing_title"),
+                    description_ru=car.get("description_ru"),
+                    description_ro=car.get("description_ro"),
                     item_id=item_id,
                     category_id=raw.get("categoryId"),
                     body_type_option_id=car.get("body_type_option_id"),
