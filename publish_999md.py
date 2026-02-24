@@ -179,51 +179,50 @@ YEAR_MAX_999 = 2030
 
 # Шаблон объявления 999: заголовок и описание на румынском и русском (без внешних ссылок).
 TEMPLATE_LISTING_TITLE = "{MARKA} {MODEL} {ANI} {MOTOR} | Credit 0% Avans | Aprobare rapidă"
-TEMPLATE_DESC_RO = """🚘 {{MARCA}} {{MODEL}} {{AN}}
-⚙️ {{MOTOR}}{{FUEL}} | {{TRACTIUNE}} | {{CUTIE}}
-💰 Preț: {{PRET}} €
-━━━━━━━━━━━━━━━━━━
-✅ CREDIT AUTO – ANALIZĂ INDIVIDUALĂ
-━━━━━━━━━━━━━━━━━━
-✔ Termen de achitare: 12 – 60 luni
-✔ Condiții personalizate
-✔ Posibilitate de avans flexibil
+TEMPLATE_DESC_RO = """{{MARCA}} {{MODEL}} {{AN}}
+{{MOTOR}}{{FUEL}} | {{TRACTIUNE}} | {{CUTIE}}
+Pret: {{PRET}} EUR
 
-🔹 Eligibilitate:
-– venit stabil (oficial sau din străinătate)
-– istoric financiar analizat individual
-– buletin de identitate
+CREDIT AUTO - ANALIZA INDIVIDUALA
 
-🔹 Condiții:
-– automobilul se înmatriculează pe numele clientului
-– deveniți proprietar imediat
-– achitare anticipată fără penalități
+- Termen de achitare: 12 - 60 luni
+- Conditii personalizate
+- Posibilitate de avans flexibil
 
-📍 Adresa:
-mun. Chișinău, str. Studenților 11"""
-TEMPLATE_DESC_RU = """🚘 {{MARCA}} {{MODEL}} {{ГОД}}
-⚙️ {{ДВИГАТЕЛЬ}}{{ТОПЛИВО}} | {{ПРИВОД}} | {{КОРОБКА}}
-💰 Цена: {{ЦЕНА}} €
+Eligibilitate:
+- venit stabil (oficial sau din strainatate)
+- istoric financiar analizat individual
+- buletin de identitate
 
-━━━━━━━━━━━━━━━━━━
-✅ АВТОКРЕДИТ – ИНДИВИДУАЛЬНОЕ РАССМОТРЕНИЕ
-━━━━━━━━━━━━━━━━━━
-✔ Срок кредитования: 12 – 60 месяцев
-✔ Индивидуальные условия
-✔ Гибкий первоначальный взнос
+Conditii:
+- automobilul se inmatriculeaza pe numele clientului
+- deveniti proprietar imediat
+- achitare anticipata fara penalitati
 
-🔹 Требования:
-– стабильный доход (в стране или за границей)
-– индивидуальный финансовый анализ
-– удостоверение личности
+Adresa:
+mun. Chisinau, str. Studentilor 11"""
+TEMPLATE_DESC_RU = """{{MARCA}} {{MODEL}} {{ГОД}}
+{{ДВИГАТЕЛЬ}}{{ТОПЛИВО}} | {{ПРИВОД}} | {{КОРОБКА}}
+Цена: {{ЦЕНА}} EUR
 
-🔹 Условия:
-– автомобиль оформляется на клиента
-– вы сразу становитесь владельцем
-– досрочное погашение без штрафов
+АВТОКРЕДИТ - ИНДИВИДУАЛЬНОЕ РАССМОТРЕНИЕ
 
-📍 Adresa:
-mun. Chișinău, str. Studenților 11"""
+- Срок кредитования: 12 - 60 месяцев
+- Индивидуальные условия
+- Гибкий первоначальный взнос
+
+Требования:
+- стабильный доход (в стране или за границей)
+- индивидуальный финансовый анализ
+- удостоверение личности
+
+Условия:
+- автомобиль оформляется на клиента
+- вы сразу становитесь владельцем
+- досрочное погашение без штрафов
+
+Адрес:
+mun. Chisinau, str. Studentilor 11"""
 
 # Явный маппинг Bitrix (значение, lower) -> 999 option id. По данным GET /features (lang=ru).
 # 102=Тип кузова. Bitrix Caroserie (IBLOCK 100): Hatchback, MPV, Sedan, Universal, SUV, Bus|Passageri, Bus|Cargo, Coupe, Cabrio, Evacuator, Minivan.
@@ -1786,6 +1785,28 @@ def _strip_numar_from_title(s: str) -> str:
     return s
 
 
+def _sanitize_999_description_text(text: str) -> str:
+    """Remove emoji/decorative symbols before sending description to 999."""
+    if not text:
+        return ""
+    out: List[str] = []
+    for ch in str(text):
+        if ch in ("\n", "\r", "\t"):
+            out.append(ch)
+            continue
+        if ch in ("\u200c", "\u200d", "\ufe0e", "\ufe0f"):
+            continue
+        cat = unicodedata.category(ch)
+        if cat in ("So", "Cs"):
+            continue
+        out.append(ch)
+    s = "".join(out).replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r" *\n *", "\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
 def build_advert_payload(
     marca: str,
     model: str,
@@ -1858,13 +1879,14 @@ def build_advert_payload(
 
     # Описание: RU и RO отдельно — 999 подставляет текст по выбранному языку (не оба сразу).
     # Пробуем передать объект {"ru": "...", "ro": "..."}; если API примет только строку — будет fallback.
-    description_ru = (kwargs.get("description_ru") or "").strip()
-    description_ro = (kwargs.get("description_ro") or "").strip()
+    description_ru = _sanitize_999_description_text((kwargs.get("description_ru") or "").strip())
+    description_ro = _sanitize_999_description_text((kwargs.get("description_ro") or "").strip())
     if description_ru and description_ro:
         add("13", {"ru": description_ru, "ro": description_ro})
     else:
         body_text = _strip_numar_from_description(description or "", numar_auto) or ""
         body_text = _strip_external_links_from_description(body_text) or ""
+        body_text = _sanitize_999_description_text(body_text)
         if body_text:
             add("13", body_text)
 
