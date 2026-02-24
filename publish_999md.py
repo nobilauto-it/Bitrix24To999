@@ -26,7 +26,7 @@ import threading
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 import psycopg2
@@ -312,7 +312,7 @@ ENABLE_ENUM_API_LOOKUP = True
 # Токен 999.md: env API_999MD_TOKEN или запасной (подставь свой)
 API_999MD_TOKEN_DEFAULT = os.getenv("API_999MD_TOKEN", "TreE0PnGG7MGZJUuxZUwDWN_UZNY")
 # Телефон в «Контактах» на 999: env PUBLISH_999MD_PHONE. Дефолт пустой — когда будет номер, задай в .env или сюда.
-PUBLISH_999MD_PHONE_DEFAULT = ""
+PUBLISH_999MD_PHONE_DEFAULT = "37360410905"
 
 # Вебхук Bitrix24: только захардкоженный (без .env)
 BITRIX_WEBHOOK_DEFAULT = "https://nobilauto.bitrix24.ru/rest/18397/h5c7kw97sfp3uote"
@@ -571,7 +571,18 @@ def upload_image_from_url_optional(image_url: str) -> Tuple[Optional[str], Optio
         image_id = r.json().get("image_id")
         return (image_id if image_id else None, None)
     except Exception as e:
-        print(f"WARN: skip photo (upload to 999 failed): {e}", file=sys.stderr, flush=True)
+        if isinstance(e, requests.HTTPError) and getattr(e, "response", None) is not None:
+            resp = e.response
+            body = (resp.text or "").strip().replace("\n", " ")
+            if len(body) > 300:
+                body = body[:300] + "..."
+            print(
+                f"WARN: skip photo (upload to 999 failed): HTTP {resp.status_code}; body={body}",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(f"WARN: skip photo (upload to 999 failed): {e}", file=sys.stderr, flush=True)
         return (None, None)
 
 
@@ -1617,7 +1628,7 @@ def car_data_from_raw(raw: Dict[str, Any]) -> Dict[str, Any]:
         "price_unit": "eur",
         "mileage_km": mileage_val,
         "numar_auto": numar_auto,
-        "phone": (os.getenv("PUBLISH_999MD_PHONE") or "").strip() or PUBLISH_999MD_PHONE_DEFAULT,
+        "phone": PUBLISH_999MD_PHONE_DEFAULT,
         "image_urls": photo_urls,
         "body_type_option_id": body_type_option_id,
         "fuel_option_id": fuel_option_id,
@@ -1863,12 +1874,9 @@ def build_advert_payload(
         raise ValueError("999.md требует хотя бы одно фото (feature 14). Укажите image_urls или image_paths.")
 
     if phone:
-        normalized = re.sub(r"[^\d+]", "", phone)
-        if normalized.startswith("0"):
-            normalized = "373" + normalized[1:]
-        elif not normalized.startswith("373"):
-            normalized = "373" + normalized
-        add("16", [normalized])
+        normalized = _normalize_999_contact_phone(phone)
+        if normalized:
+            add("16", [normalized])
 
     # access_policy "public" — объявление сразу в «Активные» на 999.
     return {
@@ -1878,6 +1886,64 @@ def build_advert_payload(
         "features": features,
         "access_policy": "public",
     }
+
+
+def _normalize_999_contact_phone(phone: str) -> str:
+    """999 contacts feature expects digits-only international format like 373XXXXXXXX."""
+    normalized = re.sub(r"\D", "", phone or "")
+    if not normalized:
+        return ""
+    if normalized.startswith("0"):
+        normalized = "373" + normalized[1:]
+    elif not normalized.startswith("373"):
+        normalized = "373" + normalized
+    return normalized
+
+
+def _extract_phone_feature_value(features_payload: Any) -> Optional[List[str]]:
+    source_features = None
+    if isinstance(features_payload, dict):
+        if isinstance(features_payload.get("features"), list):
+            source_features = features_payload.get("features")
+        elif isinstance(features_payload.get("data"), dict) and isinstance(features_payload["data"].get("features"), list):
+            source_features = features_payload["data"].get("features")
+        elif isinstance(features_payload.get("data"), list):
+            source_features = features_payload.get("data")
+    elif isinstance(features_payload, list):
+        source_features = features_payload
+
+    if not isinstance(source_features, list):
+        return None
+
+    for feature in source_features:
+        if isinstance(feature, dict) and str(feature.get("id")) == "16":
+            value = feature.get("value")
+            if isinstance(value, list):
+                return [str(v) for v in value]
+            return None
+    return None
+
+
+def ensure_advert_phone_contact(advert_id: str, phone: str) -> None:
+    """Force contacts feature on advert and verify it was stored."""
+    normalized = _normalize_999_contact_phone(phone)
+    if not normalized:
+        return
+
+    patch_advert_features(str(advert_id), [{"id": "16", "value": [normalized]}])
+    try:
+        current = get_advert_features(str(advert_id))
+        saved = _extract_phone_feature_value(current) or []
+        if normalized not in saved:
+            print(
+                f"WARN: contact phone not saved on advert {advert_id}; expected={normalized}, got={saved}",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(f"INFO: contact phone saved on advert {advert_id}: {normalized}", flush=True)
+    except Exception as e:
+        print(f"WARN: verify contact phone on advert {advert_id} failed: {e}", file=sys.stderr, flush=True)
 
 
 def _save_draft_payload(payload: Dict[str, Any], item_id: Optional[int] = None) -> str:
@@ -1908,12 +1974,45 @@ def patch_advert_features(advert_id: str, features: List[Dict[str, Any]]) -> Dic
     """PATCH /adverts/{id} — обновить объявление (features: заголовок, описание, цена, фото и т.д.)."""
     return _patch_json(f"/adverts/{advert_id}", {"features": features})
 
+def _preserve_phone_feature_for_patch(advert_id: str, features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep existing feature 16 on PATCH when local payload has no phone."""
+    if any(str(f.get("id")) == "16" for f in features):
+        return features
+    try:
+        current = get_advert_features(advert_id)
+    except Exception as e:
+        print(
+            f"WARN: get_advert_features({advert_id}) before PATCH failed (phone may be cleared): {e}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return features
+
+    source_features = None
+    if isinstance(current, dict):
+        if isinstance(current.get("features"), list):
+            source_features = current.get("features")
+        elif isinstance(current.get("data"), dict) and isinstance(current["data"].get("features"), list):
+            source_features = current["data"].get("features")
+        elif isinstance(current.get("data"), list):
+            source_features = current.get("data")
+    elif isinstance(current, list):
+        source_features = current
+
+    if not isinstance(source_features, list):
+        return features
+
+    for feature in source_features:
+        if isinstance(feature, dict) and str(feature.get("id")) == "16":
+            return [*features, feature]
+    return features
 
 def update_advert_from_item(
     advert_id: str,
     item_id: int,
     car: Optional[Dict[str, Any]] = None,
     raw: Optional[Dict[str, Any]] = None,
+    update_photos: bool = True,
 ) -> Dict[str, Any]:
     """Обновить объявление на 999 по данным из Битрикса (item_id). Загружает фото, собирает payload, PATCH /adverts/{id}. Если фото с Битрикс не загрузились — обновляем только цену/описание/поля, фото на 999 не трогаем."""
     if car is None or raw is None:
@@ -1923,7 +2022,7 @@ def update_advert_from_item(
         car = car_data_from_raw(raw)
     image_urls = car.get("image_urls") or []
     image_ids: List[str] = []
-    if image_urls:
+    if update_photos and image_urls:
         for url in image_urls:
             img_id, _ = upload_image_from_url_optional(url)
             if img_id:
@@ -1950,9 +2049,19 @@ def update_advert_from_item(
         engine_option_id=car.get("engine_option_id"),
         drive_option_id=car.get("drive_option_id"),
         transmission_option_id=car.get("transmission_option_id"),
-        skip_photos=not image_ids,
+        skip_photos=(not update_photos) or (not image_ids),
     )
-    return patch_advert_features(str(advert_id), payload["features"])
+    car_phone = car.get("phone") or ""
+    features_for_patch = payload["features"]
+    if not car_phone:
+        features_for_patch = _preserve_phone_feature_for_patch(str(advert_id), features_for_patch)
+    result = patch_advert_features(str(advert_id), features_for_patch)
+    if car_phone:
+        try:
+            ensure_advert_phone_contact(str(advert_id), car_phone)
+        except Exception as e:
+            print(f"WARN: ensure phone contact on PATCH advert {advert_id}: {e}", file=sys.stderr, flush=True)
+    return result
 
 
 def patch_advert_state(advert_id: str, state: str) -> Optional[Dict[str, Any]]:
@@ -2042,7 +2151,7 @@ def _sync_999_adverts_from_db() -> None:
             if item_id is None or advert_id is None:
                 continue
             try:
-                update_advert_from_item(str(advert_id), int(item_id))
+                update_advert_from_item(str(advert_id), int(item_id), update_photos=False)
                 updated += 1
                 print(f"AUTO_999: PATCH объявление 999 item_id={item_id} advert_id={advert_id}", flush=True)
                 if SYNC_999_DELAY_BETWEEN_SEC > 0:
@@ -2440,26 +2549,20 @@ def publish_car_manual(
     **kwargs: Any,
 ) -> Dict[str, Any]:
     image_ids: List[str] = []
-    first_failed_url: Optional[str] = None
-    first_failed_code: Optional[int] = None
     if image_paths:
         for path in image_paths:
             image_ids.append(upload_image(path))
     if image_urls:
         for url in image_urls:
-            img_id, failed_code = upload_image_from_url_optional(url)
-            if img_id:
-                image_ids.append(img_id)
-            elif failed_code and first_failed_url is None:
-                first_failed_url = url
-                first_failed_code = failed_code
+            try:
+                image_ids.append(upload_image_from_url(url))
+            except Exception as e:
+                raise RuntimeError(f"Ошибка загрузки фото на 999: ...{url[-120:]} ; {e}") from e
     # Строго как в TG: все фото должны загрузиться, частичная загрузка не допускается
     if image_urls and len(image_ids) < len(image_urls):
         msg = (
             "Не все фото загружены (401/403 от Bitrix или ошибка). Объявление не публикуется."
         )
-        if first_failed_code and first_failed_url:
-            msg += f" Первый запрос: {first_failed_code} для URL ...{first_failed_url[-80:]}"
         raise RuntimeError(msg)
     if image_urls and not image_ids:
         raise RuntimeError(
@@ -2543,6 +2646,11 @@ def publish_car_manual(
     # Объявление создано с access_policy "public" в payload — сразу в «Активные». Дополнительно выставляем public на случай, если API не учёл payload.
     advert_id = (result.get("advert") or {}).get("id")
     if advert_id:
+        if phone:
+            try:
+                ensure_advert_phone_contact(str(advert_id), phone)
+            except Exception as e:
+                print(f"WARN: ensure phone contact on POST advert {advert_id}: {e}", file=sys.stderr, flush=True)
         try:
             set_advert_access_policy(str(advert_id), "public")
         except Exception as e:
@@ -2560,62 +2668,95 @@ def publish_car_manual(
 
 
 def publish_random_car_to_999() -> Optional[Dict[str, Any]]:
-    raw = fetch_random_raw_for_999()
-    if not raw:
-        return None
-    car = car_data_from_raw(raw)
-    if not car.get("image_urls"):
-        return None
-    if not car.get("marca") or not car.get("model"):
-        return None
-    if not car.get("price") or car["price"] <= 0:
-        return None
-    item_id = get_item_id_from_raw(raw)
-    try:
-        result = publish_car_manual(
-            marca=car["marca"],
-            model=car["model"],
-            year=car["year"],
-            price=car["price"],
-            price_unit=car.get("price_unit") or "eur",
-            mileage_km=car.get("mileage_km"),
-            description=car.get("description") or "",
-            numar_auto=car.get("numar_auto") or "",
-            phone=car.get("phone") or "",
-            image_urls=car["image_urls"],
-            image_paths=None,
-            region_option_id=None,
-            listing_title=car.get("listing_title"),
-            template_listing_title=car.get("template_listing_title"),
-            description_ru=car.get("description_ru"),
-            description_ro=car.get("description_ro"),
-            item_id=item_id,
-            category_id=raw.get("categoryId"),
-            body_type_option_id=car.get("body_type_option_id"),
-            fuel_option_id=car.get("fuel_option_id"),
-            engine_option_id=car.get("engine_option_id"),
-            drive_option_id=car.get("drive_option_id"),
-            transmission_option_id=car.get("transmission_option_id"),
-        )
-        advert_id = None
-        if result:
-            aid = (result.get("advert") or {}).get("id")
-            if aid is not None:
-                try:
-                    advert_id = int(aid)
-                except (TypeError, ValueError):
-                    pass
-        conn = _pg_conn()
+    max_attempts = 10
+    tried_item_ids: Set[int] = set()
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, max_attempts + 1):
+        raw = fetch_random_raw_for_999()
+        if not raw:
+            return None
+
+        item_id = get_item_id_from_raw(raw)
+        if item_id is not None and item_id in tried_item_ids:
+            continue
+        if item_id is not None:
+            tried_item_ids.add(item_id)
+
+        car = car_data_from_raw(raw)
+        if not car.get("image_urls"):
+            continue
+        if not car.get("marca") or not car.get("model"):
+            continue
+        if not car.get("price") or car["price"] <= 0:
+            continue
+
         try:
-            _mark_sent_to_999(conn, item_id, advert_id)
-        finally:
-            conn.close()
-        if advert_id is not None:
-            update_bitrix_999_publication_fields(item_id, advert_id)
-        return {"ok": True, "999md": result, "source": "random", "item_id": item_id}
-    except Exception as e:
-        print(f"ERROR publish_random_car_to_999: {e}", file=sys.stderr, flush=True)
-        raise
+            result = publish_car_manual(
+                marca=car["marca"],
+                model=car["model"],
+                year=car["year"],
+                price=car["price"],
+                price_unit=car.get("price_unit") or "eur",
+                mileage_km=car.get("mileage_km"),
+                description=car.get("description") or "",
+                numar_auto=car.get("numar_auto") or "",
+                phone=car.get("phone") or "",
+                image_urls=car["image_urls"],
+                image_paths=None,
+                region_option_id=None,
+                listing_title=car.get("listing_title"),
+                template_listing_title=car.get("template_listing_title"),
+                description_ru=car.get("description_ru"),
+                description_ro=car.get("description_ro"),
+                item_id=item_id,
+                category_id=raw.get("categoryId"),
+                body_type_option_id=car.get("body_type_option_id"),
+                fuel_option_id=car.get("fuel_option_id"),
+                engine_option_id=car.get("engine_option_id"),
+                drive_option_id=car.get("drive_option_id"),
+                transmission_option_id=car.get("transmission_option_id"),
+            )
+            advert_id = None
+            if result:
+                aid = (result.get("advert") or {}).get("id")
+                if aid is not None:
+                    try:
+                        advert_id = int(aid)
+                    except (TypeError, ValueError):
+                        pass
+            conn = _pg_conn()
+            try:
+                _mark_sent_to_999(conn, item_id, advert_id)
+            finally:
+                conn.close()
+            if advert_id is not None:
+                update_bitrix_999_publication_fields(item_id, advert_id)
+            return {
+                "ok": True,
+                "999md": result,
+                "source": "random",
+                "item_id": item_id,
+                "attempt": attempt,
+            }
+        except Exception as e:
+            last_error = e
+            err_text = str(e)
+            # Частая причина: одна из фотографий не загрузилась на 999. Пробуем следующую случайную машину.
+            if "Не все фото загружены" in err_text or "Не удалось загрузить ни одного фото" in err_text:
+                print(
+                    f"WARN publish_random_car_to_999 attempt={attempt}/{max_attempts} item_id={item_id}: {err_text}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            print(f"ERROR publish_random_car_to_999: {e}", file=sys.stderr, flush=True)
+            raise
+
+    if last_error is not None:
+        print(f"ERROR publish_random_car_to_999: {last_error}", file=sys.stderr, flush=True)
+        raise last_error
+    return None
 
 
 def _auto_publish_loop() -> None:
@@ -2752,3 +2893,4 @@ def start_auto_publish_999_thread() -> None:
     t = threading.Thread(target=_auto_publish_loop, daemon=True)
     t.start()
     print("AUTO_999: фоновый поток авто-отправки на 999 запущен.", flush=True)
+
