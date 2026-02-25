@@ -1205,6 +1205,9 @@ def _ensure_999_sent_table(conn) -> None:
             )
             """
         )
+        cur.execute(f"ALTER TABLE {SENT_999_TABLE} ADD COLUMN IF NOT EXISTS advert_id BIGINT")
+        cur.execute(f"ALTER TABLE {SENT_999_TABLE} ADD COLUMN IF NOT EXISTS last_sync_raw_hash TEXT")
+        cur.execute(f"ALTER TABLE {SENT_999_TABLE} ADD COLUMN IF NOT EXISTS last_sync_at TIMESTAMPTZ")
     conn.commit()
 
 
@@ -1225,15 +1228,52 @@ def _was_sent_to_tg(conn, item_id: int) -> bool:
         return False
 
 
+def _get_item_raw_hash_for_999(conn, item_id: int) -> Optional[str]:
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT md5(COALESCE(t.raw::text, ''))
+                FROM {DATA_TABLE_SP1114} t
+                WHERE (t.raw->>'id')::bigint = %s
+                LIMIT 1
+                """,
+                (int(item_id),),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return str(row[0]) if row[0] else None
+    except Exception:
+        return None
+
+
+def _mark_999_sync_state(conn, item_id: int, raw_hash: Optional[str]) -> None:
+    _ensure_999_sent_table(conn)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE {SENT_999_TABLE}
+            SET last_sync_raw_hash = %s,
+                last_sync_at = now()
+            WHERE item_id = %s
+            """,
+            (raw_hash, int(item_id)),
+        )
+    conn.commit()
+
+
 def _mark_sent_to_999(conn, item_id: int, advert_id: Optional[int] = None) -> None:
     """Записать item_id (и advert_id при наличии) в b24_999_sent_items."""
     _ensure_999_sent_table(conn)
+    raw_hash = _get_item_raw_hash_for_999(conn, item_id)
     with conn.cursor() as cur:
         if advert_id is not None:
             cur.execute(
-                f"""INSERT INTO {SENT_999_TABLE} (item_id, advert_id) VALUES (%s, %s)
-                    ON CONFLICT (item_id) DO UPDATE SET advert_id = EXCLUDED.advert_id""",
-                (int(item_id), int(advert_id)),
+                f"""INSERT INTO {SENT_999_TABLE} (item_id, advert_id, last_sync_raw_hash, last_sync_at)
+                    VALUES (%s, %s, %s, now())
+                    ON CONFLICT (item_id) DO UPDATE SET advert_id = EXCLUDED.advert_id, last_sync_raw_hash = EXCLUDED.last_sync_raw_hash, last_sync_at = EXCLUDED.last_sync_at""",
+                (int(item_id), int(advert_id), raw_hash),
             )
         else:
             cur.execute(
@@ -2140,6 +2180,7 @@ def _hide_999_adverts_for_success_stage() -> None:
     conn = None
     try:
         conn = _pg_conn()
+        _ensure_999_sent_table(conn)
         with conn.cursor() as cur:
             cur.execute(
                 f"""
@@ -2179,26 +2220,29 @@ def _sync_999_adverts_from_db() -> None:
     conn = None
     try:
         conn = _pg_conn()
+        _ensure_999_sent_table(conn)
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT item_id, advert_id
-                FROM {SENT_999_TABLE}
-                WHERE advert_id IS NOT NULL
-                ORDER BY sent_at DESC NULLS LAST
+                SELECT s.item_id, s.advert_id, md5(COALESCE(t.raw::text, '')) AS raw_hash
+                FROM {SENT_999_TABLE} s
+                INNER JOIN {DATA_TABLE_SP1114} t ON (t.raw->>'id')::bigint = s.item_id
+                WHERE s.advert_id IS NOT NULL
+                  AND (s.last_sync_raw_hash IS NULL OR s.last_sync_raw_hash <> md5(COALESCE(t.raw::text, '')))
+                ORDER BY s.sent_at DESC NULLS LAST
                 LIMIT %s
                 """,
                 (max(1, SYNC_999_MAX_PER_RUN),),
             )
             rows = cur.fetchall()
-        conn.close()
         updated = 0
         for row in rows or []:
-            item_id, advert_id = row[0], row[1]
+            item_id, advert_id, raw_hash = row[0], row[1], row[2]
             if item_id is None or advert_id is None:
                 continue
             try:
                 update_advert_from_item(str(advert_id), int(item_id), update_photos=False)
+                _mark_999_sync_state(conn, int(item_id), str(raw_hash) if raw_hash else None)
                 updated += 1
                 print(f"AUTO_999: PATCH объявление 999 item_id={item_id} advert_id={advert_id}", flush=True)
                 if SYNC_999_DELAY_BETWEEN_SEC > 0:
@@ -3158,6 +3202,7 @@ def start_auto_publish_999_thread() -> None:
         return
     try:
         conn = _pg_conn()
+        _ensure_999_sent_table(conn)
         with conn.cursor() as cur:
             cur.execute(f"SELECT count(*) FROM {SENT_999_TABLE}")
             row = cur.fetchone()
