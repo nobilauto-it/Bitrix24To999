@@ -98,6 +98,19 @@ _eligible_released_set: set = set()
 _eligible_release_times: List[Tuple[int, float]] = []
 _eligible_lock = threading.Lock()
 
+# Retro auto-publish (отдельный одноразовый запуск через API): 2 машины в час, без фильтра "последние 14 дней".
+RETRO_AUTO_999_MAX_PER_HOUR = 2
+RETRO_AUTO_999_WINDOW_SEC = 3600
+RETRO_AUTO_999_POLL_SEC = 30
+_retro_auto_999_lock = threading.Lock()
+_retro_auto_999_running = False
+_retro_auto_999_thread: Optional[threading.Thread] = None
+_retro_auto_999_sent_times: List[float] = []
+_retro_auto_999_started_at: Optional[float] = None
+_retro_auto_999_last_item_id: Optional[int] = None
+_retro_auto_999_last_error: Optional[str] = None
+_retro_auto_999_total_sent: int = 0
+
 SENT_999_TABLE = "public.b24_999_sent_items"
 # Таблица отправленных в TG_AUTO (auto_send_tg). На 999 шлём ТОЛЬКО те машины, что уже есть в TG — одна логика публикации.
 SENT_TG_TABLE = "public.tg_sent_items"
@@ -1228,7 +1241,7 @@ def _mark_sent_to_999(conn, item_id: int, advert_id: Optional[int] = None) -> No
     conn.commit()
 
 
-def fetch_next_raw_for_999() -> Optional[Dict[str, Any]]:
+def fetch_next_raw_for_999(include_last_14_days_only: bool = True) -> Optional[Dict[str, Any]]:
     """Следующая машина для 999. Только стадии Nobil 1/2/Arena, ещё не на 999. Без привязки к tg_sent_items."""
     conn = None
     try:
@@ -1248,6 +1261,16 @@ def fetch_next_raw_for_999() -> Optional[Dict[str, Any]]:
             PHOTO_RAW_KEY,
             MAX_PHOTOS_999,
         )
+        created_filter_sql = (
+            f"AND {created_expr} >= (now() AT TIME ZONE 'UTC') - interval '14 days'"
+            if include_last_14_days_only else
+            ""
+        )
+        order_sql = (
+            f"{created_expr} DESC NULLS LAST"
+            if include_last_14_days_only else
+            f"{created_expr} ASC NULLS LAST"
+        )
         q = f"""
             SELECT t.raw
             FROM {DATA_TABLE_SP1114} t
@@ -1260,9 +1283,9 @@ def fetch_next_raw_for_999() -> Optional[Dict[str, Any]]:
               AND jsonb_typeof(t.raw->%s) = 'array'
               AND jsonb_array_length(t.raw->%s) >= %s
               AND jsonb_array_length(t.raw->%s) <= %s
-              AND {created_expr} >= (now() AT TIME ZONE 'UTC') - interval '14 days'
+              {created_filter_sql}
               AND {scalar_sql}
-            ORDER BY {created_expr} DESC NULLS LAST
+            ORDER BY {order_sql}
             LIMIT 1
         """
         with conn.cursor() as cur:
@@ -2336,6 +2359,27 @@ def api_eligible_all(limit: int = 500) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/retro-autopublish/start")
+@router.post("/retro-autopublish/start")
+def api_retro_autopublish_start() -> Dict[str, Any]:
+    """Одноразово запустить отдельный ретро-поток: 2 машины/час без фильтра последних 14 дней."""
+    try:
+        return start_retro_auto_publish_999_thread()
+    except Exception as e:
+        print(f"ERROR api_retro_autopublish_start: {e}", file=sys.stderr, flush=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/retro-autopublish/status")
+def api_retro_autopublish_status() -> Dict[str, Any]:
+    """Статус ретро-потока публикации на 999."""
+    try:
+        return get_retro_auto_publish_999_status()
+    except Exception as e:
+        print(f"ERROR api_retro_autopublish_status: {e}", file=sys.stderr, flush=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/adverts-debug")
 def api_get_adverts_debug(
     page: int = 1,
@@ -2894,6 +2938,204 @@ def _auto_publish_loop() -> None:
             print(f"AUTO_999: ошибка цикла: {e}", file=sys.stderr, flush=True)
 
 
+def _retro_auto_publish_loop() -> None:
+    """Отдельный фоновый ретро-режим: по 2 машины/час, те же проверки, но без фильтра последних 14 дней."""
+    global _retro_auto_999_running, _retro_auto_999_last_item_id, _retro_auto_999_last_error, _retro_auto_999_total_sent
+    while True:
+        try:
+            with _retro_auto_999_lock:
+                if not _retro_auto_999_running:
+                    return
+
+                now = time.time()
+                _retro_auto_999_sent_times[:] = [t for t in _retro_auto_999_sent_times if now - t < RETRO_AUTO_999_WINDOW_SEC]
+                if len(_retro_auto_999_sent_times) >= RETRO_AUTO_999_MAX_PER_HOUR:
+                    sleep_for = RETRO_AUTO_999_POLL_SEC
+                else:
+                    sleep_for = 0
+
+            if sleep_for:
+                time.sleep(sleep_for)
+                continue
+
+            if not _token():
+                with _retro_auto_999_lock:
+                    _retro_auto_999_last_error = "999.md token not set"
+                time.sleep(RETRO_AUTO_999_POLL_SEC)
+                continue
+
+            now_local = datetime.now()
+            if not (SEND_WINDOW_START_HOUR <= now_local.hour < SEND_WINDOW_END_HOUR):
+                time.sleep(RETRO_AUTO_999_POLL_SEC)
+                continue
+
+            raw = fetch_next_raw_for_999(include_last_14_days_only=False)
+            if not raw:
+                time.sleep(RETRO_AUTO_999_POLL_SEC)
+                continue
+
+            item_id = get_item_id_from_raw(raw)
+            with _retro_auto_999_lock:
+                _retro_auto_999_last_item_id = item_id
+
+            if not should_send_like_tg(raw):
+                print(f"RETRO_999: SKIP item {item_id} does NOT pass Telegram filter", file=sys.stderr, flush=True)
+                time.sleep(1)
+                continue
+            if not item_id:
+                time.sleep(1)
+                continue
+
+            photo_urls = extract_photo_urls_from_raw(raw, _bitrix_webhook())
+            if not photo_urls:
+                print(f"RETRO_999: SKIP item {item_id} has NO valid photos (TG logic)", file=sys.stderr, flush=True)
+                time.sleep(1)
+                continue
+
+            conn = _pg_conn()
+            try:
+                if _was_sent_to_999(conn, item_id):
+                    print(f"RETRO_999: item_id={item_id} уже на 999, пропуск", flush=True)
+                    time.sleep(1)
+                    continue
+            finally:
+                conn.close()
+
+            car = car_data_from_raw(raw)
+            urls = car.get("image_urls") or []
+            if not urls:
+                print(f"RETRO_999: SKIP item {item_id} has NO valid photos (TG logic)", file=sys.stderr, flush=True)
+                time.sleep(1)
+                continue
+            if not car.get("marca") or not car.get("model"):
+                print(f"RETRO_999: item_id={item_id} без марки/модели, пропуск.", flush=True)
+                time.sleep(1)
+                continue
+            if not car.get("price") or car["price"] <= 0:
+                print(f"RETRO_999: item_id={item_id} без цены, пропуск.", flush=True)
+                time.sleep(1)
+                continue
+            if not _is_stage_allowed_for_999(raw):
+                print(f"RETRO_999: item_id={item_id} не в стадии Nobil 1/2/Arena, пропуск.", flush=True)
+                time.sleep(1)
+                continue
+
+            try:
+                print(f"RETRO_999: публикуем на 999 item_id={item_id} ...", flush=True)
+                result = publish_car_manual(
+                    marca=car["marca"],
+                    model=car["model"],
+                    year=car["year"],
+                    price=car["price"],
+                    price_unit=car.get("price_unit") or "eur",
+                    mileage_km=car.get("mileage_km"),
+                    description=car.get("description") or "",
+                    numar_auto=car.get("numar_auto") or "",
+                    phone=car.get("phone") or "",
+                    image_urls=car["image_urls"],
+                    image_paths=None,
+                    region_option_id=None,
+                    listing_title=car.get("listing_title"),
+                    template_listing_title=car.get("template_listing_title"),
+                    description_ru=car.get("description_ru"),
+                    description_ro=car.get("description_ro"),
+                    item_id=item_id,
+                    category_id=raw.get("categoryId"),
+                    body_type_option_id=car.get("body_type_option_id"),
+                    fuel_option_id=car.get("fuel_option_id"),
+                    engine_option_id=car.get("engine_option_id"),
+                    drive_option_id=car.get("drive_option_id"),
+                    transmission_option_id=car.get("transmission_option_id"),
+                )
+                advert_id = None
+                if result:
+                    aid = (result.get("advert") or {}).get("id")
+                    if aid is not None:
+                        try:
+                            advert_id = int(aid)
+                        except (TypeError, ValueError):
+                            pass
+                conn = _pg_conn()
+                try:
+                    _mark_sent_to_999(conn, item_id, advert_id)
+                finally:
+                    conn.close()
+                if advert_id is not None:
+                    update_bitrix_999_publication_fields(item_id, advert_id)
+                with _retro_auto_999_lock:
+                    _retro_auto_999_sent_times.append(time.time())
+                    _retro_auto_999_total_sent += 1
+                    _retro_auto_999_last_error = None
+                print(
+                    f"RETRO_999: отправлено на 999 item_id={item_id}" + (f" advert_id={advert_id}" if advert_id else ""),
+                    flush=True,
+                )
+            except Exception as e:
+                with _retro_auto_999_lock:
+                    _retro_auto_999_last_error = str(e)
+                print(f"RETRO_999: ошибка публикации item_id={item_id}: {e}", file=sys.stderr, flush=True)
+                time.sleep(RETRO_AUTO_999_POLL_SEC)
+        except Exception as e:
+            with _retro_auto_999_lock:
+                _retro_auto_999_last_error = str(e)
+            print(f"RETRO_999: ошибка цикла: {e}", file=sys.stderr, flush=True)
+            time.sleep(RETRO_AUTO_999_POLL_SEC)
+
+
+def start_retro_auto_publish_999_thread() -> Dict[str, Any]:
+    """Запустить отдельный ретро-поток (если ещё не запущен): 2 машины/час, без фильтра 14 дней."""
+    global _retro_auto_999_running, _retro_auto_999_thread, _retro_auto_999_started_at, _retro_auto_999_last_error
+    global _retro_auto_999_last_item_id, _retro_auto_999_total_sent
+    with _retro_auto_999_lock:
+        if _retro_auto_999_running and _retro_auto_999_thread and _retro_auto_999_thread.is_alive():
+            already_running = True
+        else:
+            already_running = False
+            _retro_auto_999_running = True
+            _retro_auto_999_sent_times.clear()
+            _retro_auto_999_started_at = time.time()
+            _retro_auto_999_last_item_id = None
+            _retro_auto_999_last_error = None
+            _retro_auto_999_total_sent = 0
+            _retro_auto_999_thread = threading.Thread(target=_retro_auto_publish_loop, daemon=True)
+            _retro_auto_999_thread.start()
+    if already_running:
+        return {
+            "ok": True,
+            "started": False,
+            "message": "RETRO_999 уже запущен",
+            "status": get_retro_auto_publish_999_status(),
+        }
+    print("RETRO_999: фоновый ретро-поток запущен (2 машины/час, без фильтра 14 дней).", flush=True)
+    return {
+        "ok": True,
+        "started": True,
+        "message": "RETRO_999 запущен: публикация по 2 машины в час (в окне отправки), без фильтра последних 14 дней",
+        "status": get_retro_auto_publish_999_status(),
+    }
+
+
+def get_retro_auto_publish_999_status() -> Dict[str, Any]:
+    with _retro_auto_999_lock:
+        now = time.time()
+        _retro_auto_999_sent_times[:] = [t for t in _retro_auto_999_sent_times if now - t < RETRO_AUTO_999_WINDOW_SEC]
+        next_slot_in_sec = 0
+        if len(_retro_auto_999_sent_times) >= RETRO_AUTO_999_MAX_PER_HOUR:
+            oldest = min(_retro_auto_999_sent_times)
+            next_slot_in_sec = max(0, int(RETRO_AUTO_999_WINDOW_SEC - (now - oldest)))
+        return {
+            "running": bool(_retro_auto_999_running and _retro_auto_999_thread and _retro_auto_999_thread.is_alive()),
+            "started_at": datetime.fromtimestamp(_retro_auto_999_started_at).isoformat() if _retro_auto_999_started_at else None,
+            "sent_in_last_hour": len(_retro_auto_999_sent_times),
+            "max_per_hour": RETRO_AUTO_999_MAX_PER_HOUR,
+            "next_slot_in_sec": next_slot_in_sec,
+            "total_sent_since_start": _retro_auto_999_total_sent,
+            "last_item_id": _retro_auto_999_last_item_id,
+            "last_error": _retro_auto_999_last_error,
+            "send_window_hours": [SEND_WINDOW_START_HOUR, SEND_WINDOW_END_HOUR],
+        }
+
+
 def start_auto_publish_999_thread() -> None:
     """Запустить фоновый поток авто-отправки на 999 (если AUTO_PUBLISH_999_ENABLED=1)."""
     if not AUTO_PUBLISH_999_ENABLED:
@@ -2915,4 +3157,3 @@ def start_auto_publish_999_thread() -> None:
     t = threading.Thread(target=_auto_publish_loop, daemon=True)
     t.start()
     print("AUTO_999: фоновый поток авто-отправки на 999 запущен.", flush=True)
-
