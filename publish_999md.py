@@ -93,6 +93,7 @@ SYNC_999_DELAY_BETWEEN_SEC = 2   # пауза между PATCH-запросам�
 # eligible-all: скользящее окно — не более N машин за 60 минут (в памяти, разовая махинация).
 ELIGIBLE_ALL_MAX_PER_WINDOW = 2
 ELIGIBLE_ALL_WINDOW_SEC = 3600
+SYNC_999_RUN_HOURS = (11, 18)    # Локальные часы запуска SYNC_999 (по одному запуску в каждый час-слот)
 # Состояние в памяти (без БД): какие item_id уже отдавали и когда (для скользящего окна).
 _eligible_released_set: set = set()
 _eligible_release_times: List[Tuple[int, float]] = []
@@ -110,6 +111,7 @@ _retro_auto_999_started_at: Optional[float] = None
 _retro_auto_999_last_item_id: Optional[int] = None
 _retro_auto_999_last_error: Optional[str] = None
 _retro_auto_999_total_sent: int = 0
+_sync_999_last_run_slot: Optional[str] = None
 
 SENT_999_TABLE = "public.b24_999_sent_items"
 # Таблица отправленных в TG_AUTO (auto_send_tg). На 999 шлём ТОЛЬКО те машины, что уже есть в TG — одна логика публикации.
@@ -2215,6 +2217,20 @@ def _sync_999_adverts_from_db() -> None:
                 pass
 
 
+def _maybe_sync_999_adverts_from_db() -> None:
+    """Запускать sync только по расписанию (11:00 и 18:00 локально), один раз на час-слот."""
+    global _sync_999_last_run_slot
+    now_local = datetime.now()
+    if now_local.hour not in SYNC_999_RUN_HOURS:
+        return
+    slot = now_local.strftime("%Y-%m-%d %H")
+    if _sync_999_last_run_slot == slot:
+        return
+    _sync_999_last_run_slot = slot
+    print(f"AUTO_999: запуск SYNC_999 по расписанию (slot={slot}:00)", flush=True)
+    _sync_999_adverts_from_db()
+
+
 def send_telegram_notification_999(
     advert_id: Optional[str] = None,
     marca: Optional[str] = None,
@@ -2833,7 +2849,7 @@ def _auto_publish_loop() -> None:
             if not _token():
                 continue
             _hide_999_adverts_for_success_stage()
-            _sync_999_adverts_from_db()
+            _maybe_sync_999_adverts_from_db()
             if PUBLISH_999MD_DRAFT_ONLY:
                 continue
             now_local = datetime.now()
