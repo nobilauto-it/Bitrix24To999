@@ -3131,6 +3131,21 @@ def _retro_auto_publish_loop() -> None:
                     flush=True,
                 )
             except Exception as e:
+                err_text = str(e)
+                if "crm.controller.item.getFile" in err_text and "400 Client Error" in err_text:
+                    try:
+                        conn = _pg_conn()
+                        try:
+                            _mark_sent_to_999(conn, item_id, None)
+                        finally:
+                            conn.close()
+                        with _retro_auto_999_lock:
+                            _retro_auto_999_last_error = f"SKIP item_id={item_id}: broken Bitrix photo (getFile 400)"
+                        print(f"RETRO_999: SKIP item_id={item_id} (Bitrix getFile 400), помечено как пропущенное.", file=sys.stderr, flush=True)
+                        time.sleep(1)
+                        continue
+                    except Exception as skip_err:
+                        print(f"RETRO_999: WARN skip-mark item_id={item_id}: {skip_err}", file=sys.stderr, flush=True)
                 with _retro_auto_999_lock:
                     _retro_auto_999_last_error = str(e)
                 print(f"RETRO_999: ошибка публикации item_id={item_id}: {e}", file=sys.stderr, flush=True)
