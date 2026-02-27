@@ -1283,7 +1283,10 @@ def _mark_sent_to_999(conn, item_id: int, advert_id: Optional[int] = None) -> No
     conn.commit()
 
 
-def fetch_next_raw_for_999(include_last_14_days_only: bool = True) -> Optional[Dict[str, Any]]:
+def fetch_next_raw_for_999(
+    include_last_14_days_only: bool = True,
+    enforce_max_photos: bool = True,
+) -> Optional[Dict[str, Any]]:
     """Следующая машина для 999. Только стадии Nobil 1/2/Arena, ещё не на 999. Без привязки к tg_sent_items."""
     conn = None
     try:
@@ -1293,16 +1296,18 @@ def fetch_next_raw_for_999(include_last_14_days_only: bool = True) -> Optional[D
         scalar_filters = [f"COALESCE(t.raw->>'{k}', '') <> ''" for k in REQUIRE_ALL_FILLED_SCALAR_FIELDS]
         scalar_sql = " AND ".join(scalar_filters) if scalar_filters else "TRUE"
         stage_placeholders = ", ".join(["%s"] * len(STAGE_IDS_ALLOWED_999))
-        params = (
+        params: List[Any] = [
             *STAGE_IDS_ALLOWED_999,
             CATEGORY_ID_SP1114,
             PHOTO_RAW_KEY,
             PHOTO_RAW_KEY,
             PHOTO_RAW_KEY,
             MIN_PHOTOS_999,
-            PHOTO_RAW_KEY,
-            MAX_PHOTOS_999,
-        )
+        ]
+        max_photos_sql = ""
+        if enforce_max_photos:
+            max_photos_sql = "AND jsonb_array_length(t.raw->%s) <= %s"
+            params.extend([PHOTO_RAW_KEY, MAX_PHOTOS_999])
         created_filter_sql = (
             f"AND {created_expr} >= (now() AT TIME ZONE 'UTC') - interval '14 days'"
             if include_last_14_days_only else
@@ -1324,14 +1329,14 @@ def fetch_next_raw_for_999(include_last_14_days_only: bool = True) -> Optional[D
               AND t.raw ? %s
               AND jsonb_typeof(t.raw->%s) = 'array'
               AND jsonb_array_length(t.raw->%s) >= %s
-              AND jsonb_array_length(t.raw->%s) <= %s
+              {max_photos_sql}
               {created_filter_sql}
               AND {scalar_sql}
             ORDER BY {order_sql}
             LIMIT 1
         """
         with conn.cursor() as cur:
-            cur.execute(q, params)
+            cur.execute(q, tuple(params))
             row = cur.fetchone()
         if row and row[0]:
             return row[0] if isinstance(row[0], dict) else None
@@ -3029,7 +3034,7 @@ def _retro_auto_publish_loop() -> None:
                 time.sleep(RETRO_AUTO_999_POLL_SEC)
                 continue
 
-            raw = fetch_next_raw_for_999(include_last_14_days_only=False)
+            raw = fetch_next_raw_for_999(include_last_14_days_only=False, enforce_max_photos=False)
             if not raw:
                 time.sleep(RETRO_AUTO_999_POLL_SEC)
                 continue
